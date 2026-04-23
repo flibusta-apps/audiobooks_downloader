@@ -1,0 +1,10 @@
+.env
+target/
+storage/
+*.db
+*.db-*
+.DS_Store
+
+docs/superpowers
+
+bruno

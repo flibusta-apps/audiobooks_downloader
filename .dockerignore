@@ -1,0 +1,10 @@
+.git/
+.github/
+target/
+storage/
+.env
+*.db
+*.db-*
+docs/
+tests/
+bruno/
