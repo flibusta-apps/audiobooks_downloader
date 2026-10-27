@@ -10,7 +10,7 @@ axum = "0.8"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 dotenvy = "0.15"
 http = "1"
-librqbit = "8.1.1"
+librqbit = "9.0.1"
 mime_guess = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
