@@ -29,6 +29,7 @@ async fn repository_roundtrips_download_and_files() {
         magnet_uri: "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         status: DownloadStatus::PendingMetadata.as_db().to_string(),
         storage_dir: temp_dir.path().to_string_lossy().into_owned(),
+        info_hash: None,
         created_at: now,
         updated_at: now,
     })
@@ -81,4 +82,16 @@ async fn repository_roundtrips_download_and_files() {
 
     assert!(repo.get_download(download_id).await.unwrap().is_none());
     assert!(repo.list_files(download_id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn connect_creates_missing_database_file_on_first_run() {
+    let temp_dir = tempdir().unwrap();
+    let database_path = temp_dir.path().join("fresh.db");
+    let database_url = format!("sqlite://{}", database_path.display());
+
+    let pool = connect(&database_url).await.unwrap();
+    migrate(&pool).await.unwrap();
+
+    assert!(database_path.exists());
 }

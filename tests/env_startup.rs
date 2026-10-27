@@ -118,9 +118,17 @@ fn missing_dotenv_is_ignored_when_shell_config_is_present() {
 #[test]
 fn malformed_dotenv_fails_startup() {
     let dir = tempdir().unwrap();
-    std::fs::write(dir.path().join(".env"), "NOT A VALID LINE\nAPP_API_KEY=from-dotenv\n").unwrap();
+    std::fs::write(
+        dir.path().join(".env"),
+        "NOT A VALID LINE\nAPP_API_KEY=from-dotenv\n",
+    )
+    .unwrap();
 
-    let status = shell_only_command(dir.path()).spawn().unwrap().wait().unwrap();
+    let status = shell_only_command(dir.path())
+        .spawn()
+        .unwrap()
+        .wait()
+        .unwrap();
 
     assert!(!status.success());
     assert!(!dir.path().join("startup-shell-only.sqlite").exists());

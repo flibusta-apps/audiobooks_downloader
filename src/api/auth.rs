@@ -4,6 +4,8 @@ use axum::{
     response::Response,
 };
 
+use subtle::ConstantTimeEq;
+
 use crate::{error::AppError, state::AppState};
 
 pub async fn require_api_key(
@@ -16,7 +18,16 @@ pub async fn require_api_key(
         .get("x-api-key")
         .and_then(|value| value.to_str().ok());
 
-    if api_key != Some(state.config.api_key.as_str()) {
+    let valid = api_key
+        .map(|provided| {
+            provided
+                .as_bytes()
+                .ct_eq(state.config.api_key.as_bytes())
+                .into()
+        })
+        .unwrap_or(false);
+
+    if !valid {
         return Err(AppError::Unauthorized);
     }
 

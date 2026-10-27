@@ -6,7 +6,6 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use librqbit::Magnet;
 use serde::Serialize;
 use tokio_util::io::ReaderStream;
 use tower::ServiceExt;
@@ -21,6 +20,7 @@ use crate::{
     db::models::{DownloadFileRow, DownloadRow, NewDownload},
     domain::DownloadStatus,
     error::AppError,
+    magnet::sanitize_magnet,
     scheduler::ScheduledDownload,
     state::AppState,
     storage::{delete_dir_if_exists, resolve_stored_download_dir, resolve_stored_file_path},
@@ -39,8 +39,12 @@ pub async fn create_download(
     State(state): State<AppState>,
     Json(payload): Json<CreateDownloadRequest>,
 ) -> Result<(StatusCode, Json<CreateDownloadResponse>), AppError> {
-    Magnet::parse(&payload.magnet_uri)
-        .map_err(|error| AppError::InvalidInput(format!("invalid magnet uri: {error}")))?;
+    // Never hand the raw URI to librqbit: see `magnet` module docs.
+    let magnet = sanitize_magnet(
+        &payload.magnet_uri,
+        state.config.tracker_allowlist.as_deref(),
+    )
+    .await?;
 
     let id = Uuid::now_v7();
     let now = Utc::now();
@@ -50,27 +54,44 @@ pub async fn create_download(
         .await
         .map_err(|error| AppError::Storage(error.to_string()))?;
 
-    if let Err(error) = state
+    let existing = match state
         .repo
-        .insert_download(NewDownload {
+        .insert_download_dedup(NewDownload {
             id,
-            magnet_uri: payload.magnet_uri.clone(),
+            magnet_uri: magnet.uri.clone(),
             status: DownloadStatus::PendingMetadata.as_db().to_string(),
             storage_dir: storage_dir.to_string_lossy().into_owned(),
+            info_hash: Some(magnet.info_hash.clone()),
             created_at: now,
             updated_at: now,
         })
         .await
     {
+        Ok(existing) => existing,
+        Err(error) => {
+            let _ = tokio::fs::remove_dir_all(&storage_dir).await;
+            return Err(error);
+        }
+    };
+
+    if let Some(existing) = existing {
         let _ = tokio::fs::remove_dir_all(&storage_dir).await;
-        return Err(error);
+        let status = effective_download_status(&existing)?;
+        return Ok((
+            StatusCode::OK,
+            Json(CreateDownloadResponse {
+                id: existing.id,
+                status: status.as_db(),
+                created_at: existing.created_at,
+            }),
+        ));
     }
 
     if let Err(error) = state
         .scheduler
         .schedule(ScheduledDownload {
             id,
-            magnet_uri: payload.magnet_uri,
+            magnet_uri: magnet.uri,
             storage_dir: storage_dir.clone(),
         })
         .await
@@ -138,6 +159,7 @@ pub async fn delete_download(
     )
     .await?;
 
+    // Stop the torrent first so nothing writes into the directory afterwards.
     let _ = state.scheduler.cancel(id).await;
     delete_dir_if_exists(&storage_dir).await?;
     state.repo.delete_download(id).await?;

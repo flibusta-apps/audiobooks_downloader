@@ -37,8 +37,13 @@ impl DownloadStatus {
     }
 }
 
-pub fn compute_expires_at(completed_at: DateTime<Utc>, ttl_secs: i64) -> DateTime<Utc> {
-    completed_at + Duration::seconds(ttl_secs)
+/// Returns `None` if the TTL is non-positive or the arithmetic overflows.
+pub fn compute_expires_at(completed_at: DateTime<Utc>, ttl_secs: i64) -> Option<DateTime<Utc>> {
+    if ttl_secs <= 0 {
+        return None;
+    }
+
+    completed_at.checked_add_signed(Duration::try_seconds(ttl_secs)?)
 }
 
 #[cfg(test)]
@@ -51,8 +56,16 @@ mod tests {
         let completed_at = Utc::now();
         assert_eq!(
             compute_expires_at(completed_at, 300),
-            completed_at + Duration::seconds(300)
+            Some(completed_at + Duration::seconds(300))
         );
+    }
+
+    #[test]
+    fn expiration_arithmetic_is_checked() {
+        let now = Utc::now();
+        assert_eq!(compute_expires_at(now, i64::MAX), None);
+        assert_eq!(compute_expires_at(now, 0), None);
+        assert_eq!(compute_expires_at(now, -1), None);
     }
 
     #[test]

@@ -3,6 +3,8 @@ name: build
 on:
   pull_request:
   push:
+    branches: [main]
+    tags: ['v*']
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,8 +24,26 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
       - name: Run tests
         run: cargo test --locked
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # quick-xml: transitive via librqbit-upnp (no fix without librqbit upgrade);
+      # rsa: transitive via sqlx macros (no fixed release exists).
+      - name: Audit dependencies
+        run: >-
+          cargo audit
+          --ignore RUSTSEC-2026-0194
+          --ignore RUSTSEC-2026-0195
+          --ignore RUSTSEC-2023-0071
 
       - name: Build release binary
         run: cargo build --release --locked
@@ -78,8 +98,6 @@ jobs:
             --name audiobooks-downloader-smoke \
             -p 3000:3000 \
             -e APP_API_KEY=test-api-key \
-            -e APP_DATABASE_URL='sqlite:///app/audiobooks_downloader.db?mode=rwc' \
-            -e APP_STORAGE_ROOT=/app/storage \
             audiobooks-downloader:test
 
           for attempt in {1..30}; do

@@ -119,3 +119,34 @@ async fn ttl_expiration_skips_rows_with_storage_dirs_outside_storage_root() {
     assert_eq!(row.status, DownloadStatus::Completed.as_db());
     assert!(tokio::fs::try_exists(&outside_path).await.unwrap());
 }
+
+#[tokio::test]
+async fn stale_failed_downloads_are_removed_with_their_directories() {
+    let app = support::spawn().await;
+    let id = app.insert_pending_download().await;
+    app.repo.mark_failed(id, "boom").await.unwrap();
+    let dir = app.storage_root.join(id.to_string());
+
+    let kept = audiobooks_downloader::maintenance::cleanup_stale_failed_downloads(
+        &app.repo,
+        &app.storage_root,
+        3600,
+    )
+    .await
+    .unwrap();
+    assert_eq!(kept, 0);
+    assert!(dir.exists());
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let removed = audiobooks_downloader::maintenance::cleanup_stale_failed_downloads(
+        &app.repo,
+        &app.storage_root,
+        1,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(removed, 1);
+    assert!(!dir.exists());
+    assert!(app.repo.get_download(id).await.unwrap().is_none());
+}

@@ -8,6 +8,8 @@ use axum::{
     Router,
 };
 
+use tower_http::trace::TraceLayer;
+
 use crate::state::AppState;
 
 use self::{
@@ -21,10 +23,7 @@ use self::{
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/downloads", post(create_download))
-        .route(
-            "/downloads/{id}",
-            get(get_download).delete(delete_download),
-        )
+        .route("/downloads/{id}", get(get_download).delete(delete_download))
         .route("/downloads/{id}/files", get(list_files))
         .route("/downloads/{id}/files/{file_index}", get(download_file))
         .route(
@@ -44,4 +43,5 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .merge(protected_api)
         .with_state(state)
+        .layer(TraceLayer::new_for_http())
 }
