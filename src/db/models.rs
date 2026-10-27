@@ -9,6 +9,7 @@ pub struct DownloadRow {
     pub torrent_name: Option<String>,
     pub status: String,
     pub storage_dir: String,
+    pub info_hash: Option<String>,
     pub total_bytes: Option<i64>,
     pub downloaded_bytes: i64,
     pub error_message: Option<String>,
@@ -34,6 +35,7 @@ pub struct NewDownload {
     pub magnet_uri: String,
     pub status: String,
     pub storage_dir: String,
+    pub info_hash: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

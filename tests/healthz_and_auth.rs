@@ -31,6 +31,11 @@ async fn healthz_is_public_and_download_creation_requires_api_key() {
             api_key: "test-api-key".to_string(),
             download_ttl_secs: 86_400,
             cleanup_interval_secs: 60,
+            max_concurrent_downloads: 3,
+            metadata_timeout_secs: 600,
+            no_progress_timeout_secs: 600,
+            max_torrent_bytes: None,
+            tracker_allowlist: None,
         }),
         repo: DownloadRepo::new(pool),
         scheduler: Arc::new(NoopScheduler),
@@ -80,12 +85,15 @@ async fn healthz_is_public_and_download_creation_requires_api_key() {
                 .header("x-api-key", "test-api-key")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"magnet_uri":"magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+                    r#"{"magnet_uri":"magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#,
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
 
-    assert_eq!(trailing_slash_create_response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        trailing_slash_create_response.status(),
+        StatusCode::ACCEPTED
+    );
 }

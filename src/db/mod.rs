@@ -14,6 +14,7 @@ use self::models::{DownloadFileRow, DownloadRow, NewDownload, NewDownloadFile};
 pub async fn connect(database_url: &str) -> Result<SqlitePool, AppError> {
     let options = SqliteConnectOptions::from_str(database_url)
         .map_err(AppError::from)?
+        .create_if_missing(true)
         .foreign_keys(true);
 
     SqlitePoolOptions::new()
@@ -42,14 +43,15 @@ impl DownloadRepo {
 
     pub async fn insert_download(&self, new: NewDownload) -> Result<(), AppError> {
         sqlx::query(
-            "INSERT INTO downloads (id, magnet_uri, torrent_name, status, storage_dir, total_bytes, downloaded_bytes, error_message, created_at, updated_at, metadata_at, completed_at, expires_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO downloads (id, magnet_uri, torrent_name, status, storage_dir, info_hash, total_bytes, downloaded_bytes, error_message, created_at, updated_at, metadata_at, completed_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(new.id)
         .bind(new.magnet_uri)
         .bind(Option::<String>::None)
         .bind(new.status)
         .bind(new.storage_dir)
+        .bind(new.info_hash)
         .bind(Option::<i64>::None)
         .bind(0_i64)
         .bind(Option::<String>::None)
@@ -64,9 +66,84 @@ impl DownloadRepo {
         Ok(())
     }
 
+    /// Inserts the download unless an active or unexpired completed download
+    /// with the same info-hash exists. Returns the existing row in that case.
+    /// The check and insert are one atomic statement.
+    pub async fn insert_download_dedup(
+        &self,
+        new: NewDownload,
+    ) -> Result<Option<DownloadRow>, AppError> {
+        let info_hash = new.info_hash.clone();
+        let now = Utc::now();
+        let result = sqlx::query(
+            "INSERT INTO downloads (id, magnet_uri, torrent_name, status, storage_dir, info_hash, total_bytes, downloaded_bytes, error_message, created_at, updated_at, metadata_at, completed_at, expires_at)
+             SELECT ?, ?, NULL, ?, ?, ?, NULL, 0, NULL, ?, ?, NULL, NULL, NULL
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM downloads
+                 WHERE info_hash = ?
+                   AND (status IN (?, ?)
+                        OR (status = ? AND (expires_at IS NULL OR expires_at > ?)))
+             )",
+        )
+        .bind(new.id)
+        .bind(new.magnet_uri)
+        .bind(new.status)
+        .bind(new.storage_dir)
+        .bind(&info_hash)
+        .bind(new.created_at)
+        .bind(new.updated_at)
+        .bind(&info_hash)
+        .bind(DownloadStatus::PendingMetadata.as_db())
+        .bind(DownloadStatus::Downloading.as_db())
+        .bind(DownloadStatus::Completed.as_db())
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() > 0 {
+            return Ok(None);
+        }
+
+        sqlx::query_as::<_, DownloadRow>(
+            "SELECT id, magnet_uri, torrent_name, status, storage_dir, info_hash, total_bytes, downloaded_bytes, error_message, created_at, updated_at, metadata_at, completed_at, expires_at
+             FROM downloads
+             WHERE info_hash = ?
+               AND (status IN (?, ?)
+                    OR (status = ? AND (expires_at IS NULL OR expires_at > ?)))
+             ORDER BY created_at ASC
+             LIMIT 1",
+        )
+        .bind(&info_hash)
+        .bind(DownloadStatus::PendingMetadata.as_db())
+        .bind(DownloadStatus::Downloading.as_db())
+        .bind(DownloadStatus::Completed.as_db())
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(AppError::from)
+    }
+
+    pub async fn list_stale_failed(
+        &self,
+        updated_before: DateTime<Utc>,
+    ) -> Result<Vec<DownloadRow>, AppError> {
+        sqlx::query_as::<_, DownloadRow>(
+            "SELECT id, magnet_uri, torrent_name, status, storage_dir, info_hash, total_bytes, downloaded_bytes, error_message, created_at, updated_at, metadata_at, completed_at, expires_at
+             FROM downloads
+             WHERE status IN (?, ?) AND updated_at <= ?
+             ORDER BY updated_at ASC",
+        )
+        .bind(DownloadStatus::Failed.as_db())
+        .bind(DownloadStatus::Interrupted.as_db())
+        .bind(updated_before)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(AppError::from)
+    }
+
     pub async fn get_download(&self, id: Uuid) -> Result<Option<DownloadRow>, AppError> {
         sqlx::query_as::<_, DownloadRow>(
-            "SELECT id, magnet_uri, torrent_name, status, storage_dir, total_bytes, downloaded_bytes, error_message, created_at, updated_at, metadata_at, completed_at, expires_at
+            "SELECT id, magnet_uri, torrent_name, status, storage_dir, info_hash, total_bytes, downloaded_bytes, error_message, created_at, updated_at, metadata_at, completed_at, expires_at
              FROM downloads
              WHERE id = ?",
         )
@@ -78,7 +155,7 @@ impl DownloadRepo {
 
     pub async fn list_active_downloads(&self) -> Result<Vec<DownloadRow>, AppError> {
         sqlx::query_as::<_, DownloadRow>(
-            "SELECT id, magnet_uri, torrent_name, status, storage_dir, total_bytes, downloaded_bytes, error_message, created_at, updated_at, metadata_at, completed_at, expires_at
+            "SELECT id, magnet_uri, torrent_name, status, storage_dir, info_hash, total_bytes, downloaded_bytes, error_message, created_at, updated_at, metadata_at, completed_at, expires_at
              FROM downloads
              WHERE status IN (?, ?)
              ORDER BY created_at ASC",
@@ -92,7 +169,7 @@ impl DownloadRepo {
 
     pub async fn list_completed_downloads(&self) -> Result<Vec<DownloadRow>, AppError> {
         sqlx::query_as::<_, DownloadRow>(
-            "SELECT id, magnet_uri, torrent_name, status, storage_dir, total_bytes, downloaded_bytes, error_message, created_at, updated_at, metadata_at, completed_at, expires_at
+            "SELECT id, magnet_uri, torrent_name, status, storage_dir, info_hash, total_bytes, downloaded_bytes, error_message, created_at, updated_at, metadata_at, completed_at, expires_at
              FROM downloads
              WHERE status = ?
              ORDER BY completed_at ASC, created_at ASC",
@@ -108,7 +185,7 @@ impl DownloadRepo {
         now: DateTime<Utc>,
     ) -> Result<Vec<DownloadRow>, AppError> {
         sqlx::query_as::<_, DownloadRow>(
-            "SELECT id, magnet_uri, torrent_name, status, storage_dir, total_bytes, downloaded_bytes, error_message, created_at, updated_at, metadata_at, completed_at, expires_at
+            "SELECT id, magnet_uri, torrent_name, status, storage_dir, info_hash, total_bytes, downloaded_bytes, error_message, created_at, updated_at, metadata_at, completed_at, expires_at
              FROM downloads
              WHERE status = ? AND expires_at IS NOT NULL AND expires_at <= ?
              ORDER BY expires_at ASC, created_at ASC",

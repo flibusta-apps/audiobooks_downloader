@@ -16,6 +16,9 @@ pub struct ScheduledDownload {
 pub trait DownloadScheduler: Send + Sync {
     async fn schedule(&self, job: ScheduledDownload) -> Result<(), AppError>;
     async fn cancel(&self, id: Uuid) -> Result<bool, AppError>;
+
+    /// Stops all running work. Called once on graceful shutdown.
+    async fn shutdown(&self) {}
 }
 
 pub struct NoopScheduler;

@@ -16,6 +16,8 @@ pub enum AppError {
     DownloadNotReady,
     #[error("gone")]
     Gone,
+    #[error("bad request: {0}")]
+    BadRequest(String),
     #[error("invalid input: {0}")]
     InvalidInput(String),
     #[error("storage error: {0}")]
@@ -44,6 +46,7 @@ impl IntoResponse for AppError {
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Self::DownloadNotReady => (StatusCode::CONFLICT, "download_not_ready"),
             Self::Gone => (StatusCode::GONE, "gone"),
+            Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             Self::InvalidInput(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_input"),
             Self::Storage(_) => (StatusCode::INTERNAL_SERVER_ERROR, "storage_error"),
             Self::Database(_) | Self::Internal(_) => {
@@ -53,6 +56,7 @@ impl IntoResponse for AppError {
         let message = match &self {
             Self::Storage(_) => "storage error".to_string(),
             Self::Database(_) | Self::Internal(_) => "internal error".to_string(),
+            Self::BadRequest(message) => message.clone(),
             _ => self.to_string(),
         };
 

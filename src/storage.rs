@@ -78,6 +78,27 @@ pub async fn delete_dir_if_exists(path: &Path) -> Result<(), AppError> {
     }
 }
 
+/// Takes an exclusive advisory lock on `<storage_root>/.lock`, failing if
+/// another instance holds it. The lock lives as long as the returned file.
+pub fn acquire_instance_lock(storage_root: &Path) -> Result<std::fs::File, AppError> {
+    std::fs::create_dir_all(storage_root).map_err(|error| AppError::Storage(error.to_string()))?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(storage_root.join(".lock"))
+        .map_err(|error| AppError::Storage(error.to_string()))?;
+
+    file.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => {
+            AppError::Storage("another instance is already using this storage root".to_string())
+        }
+        std::fs::TryLockError::Error(error) => AppError::Storage(error.to_string()),
+    })?;
+
+    Ok(file)
+}
+
 async fn canonicalize_path(path: &Path) -> Result<PathBuf, AppError> {
     tokio::fs::canonicalize(path)
         .await
@@ -169,6 +190,17 @@ mod tests {
     #[test]
     fn rejects_empty_paths() {
         assert!(resolve_relative_path("").is_err());
+    }
+
+    #[test]
+    fn instance_lock_is_exclusive() {
+        let root = tempdir().unwrap();
+        let first = acquire_instance_lock(root.path()).unwrap();
+
+        assert!(acquire_instance_lock(root.path()).is_err());
+
+        drop(first);
+        assert!(acquire_instance_lock(root.path()).is_ok());
     }
 
     #[tokio::test]

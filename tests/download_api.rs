@@ -356,3 +356,53 @@ async fn delete_download_rejects_tampered_storage_dirs_outside_storage_root() {
         .is_some());
     assert!(tokio::fs::try_exists(&outside_path).await.unwrap());
 }
+
+async fn post_magnet(test_app: &support::TestApp, magnet: &str) -> (StatusCode, serde_json::Value) {
+    let response = test_app
+        .app
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/downloads")
+                .header("x-api-key", "test-api-key")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "magnet_uri": magnet }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+
+    (status, serde_json::from_slice(&body).unwrap_or_default())
+}
+
+#[tokio::test]
+async fn magnet_with_select_only_is_rejected_with_400() {
+    let test_app = spawn().await;
+
+    let (status, _) = post_magnet(
+        &test_app,
+        "magnet:?xt=urn:btih:cccccccccccccccccccccccccccccccccccccccc&so=0-18446744073709551615",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(test_app.scheduler.scheduled_count().await, 0);
+}
+
+#[tokio::test]
+async fn duplicate_info_hash_returns_existing_download_without_rescheduling() {
+    let test_app = spawn().await;
+    let magnet = "magnet:?xt=urn:btih:dddddddddddddddddddddddddddddddddddddddd";
+
+    let (first_status, first) = post_magnet(&test_app, magnet).await;
+    let (second_status, second) =
+        post_magnet(&test_app, &format!("{magnet}&tr=udp://8.8.8.8:80")).await;
+
+    assert_eq!(first_status, StatusCode::ACCEPTED);
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(first["id"], second["id"]);
+    assert_eq!(test_app.scheduler.scheduled_count().await, 1);
+}
