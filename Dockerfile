@@ -28,9 +28,17 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY --from=builder /app/target/release/audiobooks_downloader /usr/local/bin/audiobooks_downloader
-COPY --from=builder /app/migrations ./migrations
+RUN useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin app \
+    && mkdir -p /data/storage \
+    && chown -R app:app /data
 
-ENV APP_BIND_ADDR=0.0.0.0:3000
+ENV APP_BIND_ADDR=0.0.0.0:3000 \
+    APP_STORAGE_ROOT=/data/storage \
+    APP_DATABASE_URL=sqlite:///data/audiobooks_downloader.db
+
+VOLUME /data
+
+USER app
 
 EXPOSE 3000
 
