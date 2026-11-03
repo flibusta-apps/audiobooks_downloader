@@ -19,7 +19,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "net", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["fs", "limit", "normalize-path", "trace"] }
+tower-http = { version = "0.7", features = ["fs", "limit", "normalize-path", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 subtle = "2"
