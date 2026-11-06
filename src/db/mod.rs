@@ -36,6 +36,11 @@ pub struct DownloadRepo {
     pool: SqlitePool,
 }
 
+pub enum InsertDownloadResult {
+    Inserted,
+    Existing(Box<DownloadRow>),
+}
+
 impl DownloadRepo {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -68,13 +73,38 @@ impl DownloadRepo {
 
     /// Inserts the download unless an active or unexpired completed download
     /// with the same info-hash exists. Returns the existing row in that case.
-    /// The check and insert are one atomic statement.
+    /// An immediate transaction serializes deduplication and capacity admission.
     pub async fn insert_download_dedup(
         &self,
         new: NewDownload,
-    ) -> Result<Option<DownloadRow>, AppError> {
+        max_tasks: usize,
+    ) -> Result<InsertDownloadResult, AppError> {
         let info_hash = new.info_hash.clone();
         let now = Utc::now();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let existing = sqlx::query_as::<_, DownloadRow>(
+            "SELECT * FROM downloads WHERE info_hash = ? AND (status IN (?, ?) OR (status = ? AND (expires_at IS NULL OR expires_at > ?))) ORDER BY created_at ASC LIMIT 1",
+        )
+        .bind(&info_hash)
+        .bind(DownloadStatus::PendingMetadata.as_db())
+        .bind(DownloadStatus::Downloading.as_db())
+        .bind(DownloadStatus::Completed.as_db())
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(existing) = existing {
+            tx.commit().await?;
+            return Ok(InsertDownloadResult::Existing(Box::new(existing)));
+        }
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM downloads WHERE status IN (?, ?)")
+                .bind(DownloadStatus::PendingMetadata.as_db())
+                .bind(DownloadStatus::Downloading.as_db())
+                .fetch_one(&mut *tx)
+                .await?;
+        if count >= i64::try_from(max_tasks).unwrap_or(i64::MAX) {
+            return Err(AppError::QueueFull);
+        }
         let result = sqlx::query(
             "INSERT INTO downloads (id, magnet_uri, torrent_name, status, storage_dir, info_hash, total_bytes, downloaded_bytes, error_message, created_at, updated_at, metadata_at, completed_at, expires_at)
              SELECT ?, ?, NULL, ?, ?, ?, NULL, 0, NULL, ?, ?, NULL, NULL, NULL
@@ -97,30 +127,16 @@ impl DownloadRepo {
         .bind(DownloadStatus::Downloading.as_db())
         .bind(DownloadStatus::Completed.as_db())
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() > 0 {
-            return Ok(None);
+            tx.commit().await?;
+            return Ok(InsertDownloadResult::Inserted);
         }
-
-        sqlx::query_as::<_, DownloadRow>(
-            "SELECT id, magnet_uri, torrent_name, status, storage_dir, info_hash, total_bytes, downloaded_bytes, error_message, created_at, updated_at, metadata_at, completed_at, expires_at
-             FROM downloads
-             WHERE info_hash = ?
-               AND (status IN (?, ?)
-                    OR (status = ? AND (expires_at IS NULL OR expires_at > ?)))
-             ORDER BY created_at ASC
-             LIMIT 1",
-        )
-        .bind(&info_hash)
-        .bind(DownloadStatus::PendingMetadata.as_db())
-        .bind(DownloadStatus::Downloading.as_db())
-        .bind(DownloadStatus::Completed.as_db())
-        .bind(now)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(AppError::from)
+        Err(AppError::Internal(
+            "dedup insertion unexpectedly skipped".into(),
+        ))
     }
 
     pub async fn list_stale_failed(
@@ -135,6 +151,20 @@ impl DownloadRepo {
         )
         .bind(DownloadStatus::Failed.as_db())
         .bind(DownloadStatus::Interrupted.as_db())
+        .bind(updated_before)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(AppError::from)
+    }
+
+    pub async fn list_stale_expired(
+        &self,
+        updated_before: DateTime<Utc>,
+    ) -> Result<Vec<DownloadRow>, AppError> {
+        sqlx::query_as::<_, DownloadRow>(
+            "SELECT * FROM downloads WHERE status = ? AND updated_at <= ? ORDER BY updated_at ASC",
+        )
+        .bind(DownloadStatus::Expired.as_db())
         .bind(updated_before)
         .fetch_all(&self.pool)
         .await

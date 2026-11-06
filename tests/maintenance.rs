@@ -9,6 +9,41 @@ use sqlx::query;
 use std::path::Path;
 
 #[tokio::test]
+async fn expired_retention_removes_only_old_expired_rows_and_cascades_files() {
+    let app = support::spawn().await;
+    let old = app
+        .insert_download_with_file(DownloadStatus::Expired, "old.mp3", b"audio", None)
+        .await;
+    let recent = app
+        .insert_download_with_file(DownloadStatus::Expired, "recent.mp3", b"audio", None)
+        .await;
+    let failed = app.insert_pending_download().await;
+    app.repo.mark_failed(failed, "failed").await.unwrap();
+    for id in [old, failed] {
+        query("UPDATE downloads SET updated_at = ? WHERE id = ?")
+            .bind(Utc::now() - Duration::days(31))
+            .bind(id)
+            .execute(&app.pool)
+            .await
+            .unwrap();
+    }
+    let removed = audiobooks_downloader::maintenance::cleanup_stale_expired_downloads(
+        &app.repo,
+        &app.storage_root,
+        30,
+    )
+    .await
+    .unwrap();
+    assert_eq!(removed, 1);
+    assert!(app.repo.get_download(old).await.unwrap().is_none());
+    assert!(app.repo.list_files(old).await.unwrap().is_empty());
+    assert!(!app.storage_root.join(old.to_string()).exists());
+    assert!(app.repo.get_download(recent).await.unwrap().is_some());
+    assert_eq!(app.repo.list_files(recent).await.unwrap().len(), 1);
+    assert!(app.repo.get_download(failed).await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn startup_recovery_marks_active_jobs_interrupted() {
     let app = support::spawn().await;
     let id = app.insert_pending_download().await;

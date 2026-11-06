@@ -31,6 +31,26 @@ use crate::{
 const CANCEL_WAIT: Duration = Duration::from_secs(15);
 const PROGRESS_TICK: Duration = Duration::from_secs(1);
 
+/// HTTP tracker redirects and response sizes cannot be constrained in librqbit
+/// 8.1.1. Strip them before either metadata resolution or the real add.
+fn tracker_policy(magnet: &str, allow_http: bool) -> String {
+    if allow_http {
+        return magnet.to_owned();
+    }
+    let Ok(mut uri) = url::Url::parse(magnet) else {
+        return magnet.to_owned();
+    };
+    let pairs: Vec<(String, String)> = uri
+        .query_pairs()
+        .filter(|(key, value)| {
+            key != "tr" || url::Url::parse(value).is_ok_and(|tracker| tracker.scheme() == "udp")
+        })
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    uri.query_pairs_mut().clear().extend_pairs(pairs);
+    uri.into()
+}
+
 #[derive(Clone, Debug)]
 pub struct SchedulerSettings {
     pub ttl_secs: i64,
@@ -38,6 +58,7 @@ pub struct SchedulerSettings {
     pub metadata_timeout: Duration,
     pub no_progress_timeout: Duration,
     pub max_torrent_bytes: Option<u64>,
+    pub max_torrent_files: usize,
 }
 
 impl SchedulerSettings {
@@ -48,13 +69,29 @@ impl SchedulerSettings {
             metadata_timeout: Duration::from_secs(config.metadata_timeout_secs),
             no_progress_timeout: Duration::from_secs(config.no_progress_timeout_secs),
             max_torrent_bytes: config.max_torrent_bytes,
+            max_torrent_files: config.max_torrent_files,
         }
     }
 }
 
 struct ActiveDownload {
     token: CancellationToken,
-    task: JoinHandle<()>,
+    task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+impl ActiveDownload {
+    async fn cancel(&self, wait: Duration) -> Result<(), AppError> {
+        // Keep the handle on timeout and serialize retries for this download.
+        let mut task = self.task.lock().await;
+        self.token.cancel();
+        if let Some(handle) = task.as_mut() {
+            match tokio::time::timeout(wait, handle).await {
+                Ok(Ok(())) => *task = None,
+                Ok(Err(_)) | Err(_) => return Err(AppError::CancellationInProgress),
+            }
+        }
+        Ok(())
+    }
 }
 
 struct Inner {
@@ -62,7 +99,7 @@ struct Inner {
     session: Arc<Session>,
     settings: SchedulerSettings,
     semaphore: Arc<Semaphore>,
-    active: Mutex<HashMap<Uuid, ActiveDownload>>,
+    active: Mutex<HashMap<Uuid, Arc<ActiveDownload>>>,
     shutdown: CancellationToken,
 }
 
@@ -92,11 +129,15 @@ impl LibrqbitScheduler {
     /// listening for incoming connections.
     pub async fn new(repo: DownloadRepo, config: &Config) -> anyhow::Result<Self> {
         let settings = SchedulerSettings::from_config(config);
+        if config.allow_http_trackers {
+            warn!("HTTP trackers enabled: redirects and unbounded tracker responses cannot be restricted by librqbit; use network egress filtering");
+        }
         let session = Session::new_with_opts(
             config.storage_root.clone(),
             SessionOptions {
                 disable_dht_persistence: true,
                 enable_upnp_port_forwarding: false,
+                socks_proxy_url: config.torrent_socks_proxy_url.clone(),
                 ..Default::default()
             },
         )
@@ -136,25 +177,36 @@ fn metadata_files(
 
         let total = metadata.lengths.total_length();
         let total_bytes = i64::try_from(total)?;
-        let mut files = Vec::new();
-        for (index, file) in metadata.file_infos.iter().enumerate() {
-            let Some(relative_path) = file.relative_filename.to_str() else {
-                warn!(file_index = index, "skipping file with non-UTF-8 name");
-                continue;
-            };
-            files.push(NewDownloadFile {
-                file_index: i64::try_from(index)?,
-                relative_path: relative_path.to_owned(),
-                size_bytes: i64::try_from(file.len)?,
-                mime_type: mime_guess::from_path(&file.relative_filename)
-                    .first_or_octet_stream()
-                    .essence_str()
-                    .to_string(),
-            });
-        }
+        let files = downloadable_files(&metadata.file_infos)?;
 
         Ok((name, total_bytes, total, files))
     })?
+}
+
+fn downloadable_files(
+    file_infos: &[librqbit::file_info::FileInfo],
+) -> anyhow::Result<Vec<NewDownloadFile>> {
+    let mut files = Vec::new();
+    for (index, file) in file_infos.iter().enumerate() {
+        if file.attrs.padding {
+            continue;
+        }
+        let Some(relative_path) = file.relative_filename.to_str() else {
+            warn!(file_index = index, "skipping file with non-UTF-8 name");
+            continue;
+        };
+        files.push(NewDownloadFile {
+            file_index: i64::try_from(index)?,
+            relative_path: relative_path.to_owned(),
+            size_bytes: i64::try_from(file.len)?,
+            mime_type: mime_guess::from_path(&file.relative_filename)
+                .first_or_octet_stream()
+                .essence_str()
+                .to_string(),
+        });
+    }
+
+    Ok(files)
 }
 
 impl Inner {
@@ -187,7 +239,7 @@ impl Inner {
         &self,
         job: &ScheduledDownload,
         cancel: &CancellationToken,
-        torrent_id: &mut Option<usize>,
+        torrent_id: &Mutex<Option<usize>>,
     ) -> Outcome {
         // Queued downloads stay `pending_metadata` until a permit is free.
         let _permit = match self
@@ -202,11 +254,62 @@ impl Inner {
 
         let deadline = Instant::now() + self.settings.metadata_timeout;
 
+        let magnet_uri = tracker_policy(&job.magnet_uri, job.allow_http_trackers);
+        let preflight = self.session.add_torrent(
+            AddTorrent::from_url(magnet_uri),
+            Some(AddTorrentOptions {
+                list_only: true,
+                output_folder: Some(job.storage_dir.display().to_string()),
+                ..Default::default()
+            }),
+        );
+        let metadata = match self.guarded(cancel, Some(deadline), preflight).await {
+            Step::Done(Ok(AddTorrentResponse::ListOnly(metadata))) => metadata,
+            Step::Done(Ok(_)) => return Outcome::Failed("unexpected metadata response"),
+            Step::Done(Err(err)) => {
+                warn!(download_id = %job.id, error = %err, "metadata resolution failed");
+                return Outcome::Failed("invalid torrent metadata");
+            }
+            Step::Cancelled => return Outcome::Cancelled,
+            Step::Shutdown => return Outcome::Shutdown,
+            Step::TimedOut => return Outcome::Failed("metadata resolution timed out"),
+        };
+        // List-only does not create payload files. Reuse exactly the checked bytes
+        // rather than resolving the magnet again (no metadata TOCTOU).
+        if metadata.info.piece_length == 0 {
+            return Outcome::Failed("invalid torrent piece length");
+        }
+        let lengths = match metadata.info.iter_file_lengths() {
+            Ok(lengths) => lengths,
+            Err(_) => return Outcome::Failed("invalid torrent file list"),
+        };
+        let mut count = 0_usize;
+        let mut total = 0_u64;
+        for length in lengths {
+            count += 1;
+            let Some(sum) = total.checked_add(length) else {
+                return Outcome::Failed("torrent size overflow");
+            };
+            total = sum;
+            if count > self.settings.max_torrent_files {
+                return Outcome::Failed("torrent exceeds maximum file count");
+            }
+        }
+        if total > i64::MAX as u64
+            || self
+                .settings
+                .max_torrent_bytes
+                .is_some_and(|max| total > max)
+        {
+            return Outcome::Failed("torrent exceeds maximum allowed size");
+        }
+
         let add = self.session.add_torrent(
-            AddTorrent::from_url(job.magnet_uri.clone()),
+            AddTorrent::from_bytes(metadata.torrent_bytes),
             Some(AddTorrentOptions {
                 overwrite: true,
                 output_folder: Some(job.storage_dir.display().to_string()),
+                initial_peers: Some(metadata.seen_peers),
                 ..Default::default()
             }),
         );
@@ -223,7 +326,7 @@ impl Inner {
 
         let handle = match response {
             AddTorrentResponse::Added(id, handle) => {
-                *torrent_id = Some(id);
+                *torrent_id.lock().unwrap_or_else(|err| err.into_inner()) = Some(id);
                 handle
             }
             AddTorrentResponse::AlreadyManaged(..) | AddTorrentResponse::ListOnly(_) => {
@@ -339,8 +442,24 @@ impl Inner {
     }
 
     async fn run(self: Arc<Self>, job: ScheduledDownload, cancel: CancellationToken) {
-        let mut torrent_id = None;
-        let outcome = self.drive(&job, &cancel, &mut torrent_id).await;
+        let worker_inner = Arc::clone(&self);
+        let worker_job = job.clone();
+        let torrent_id = Arc::new(Mutex::new(None));
+        let worker_torrent_id = Arc::clone(&torrent_id);
+        let worker_cancel = cancel.clone();
+        let worker = tokio::spawn(async move {
+            worker_inner
+                .drive(&worker_job, &worker_cancel, &worker_torrent_id)
+                .await
+        });
+        let outcome = match worker.await {
+            Ok(result) => result,
+            Err(err) => {
+                error!(download_id = %job.id, error = %err, panic = err.is_panic(), "download worker terminated");
+                Outcome::Failed("download worker panicked or terminated unexpectedly")
+            }
+        };
+        let torrent_id = *torrent_id.lock().unwrap_or_else(|err| err.into_inner());
 
         let delete_files = match &outcome {
             Outcome::Completed => {
@@ -359,19 +478,25 @@ impl Inner {
         };
 
         if let (Some(delete_files), Some(id)) = (delete_files, torrent_id) {
-            if let Err(err) = self
+            while let Err(err) = self
                 .session
                 .delete(TorrentIdOrHash::Id(id), delete_files)
                 .await
             {
                 warn!(download_id = %job.id, error = %err, "failed to remove torrent from session");
+                if !matches!(outcome, Outcome::Cancelled) {
+                    break;
+                }
+                // Do not confirm cancellation while the torrent may still write.
+                tokio::time::sleep(PROGRESS_TICK).await;
             }
         }
 
-        self.active
-            .lock()
-            .expect("active lock poisoned")
-            .remove(&job.id);
+        let mut active = self.active.lock().expect("active lock poisoned");
+        // A cancelled entry must remain discoverable until cancel confirms join.
+        if !cancel.is_cancelled() {
+            active.remove(&job.id);
+        }
     }
 }
 
@@ -388,7 +513,13 @@ impl DownloadScheduler for LibrqbitScheduler {
         // cannot finish before it has been registered.
         let mut active = self.inner.active.lock().expect("active lock poisoned");
         let task = tokio::spawn(Arc::clone(&self.inner).run(job, token.clone()));
-        active.insert(id, ActiveDownload { token, task });
+        active.insert(
+            id,
+            Arc::new(ActiveDownload {
+                token,
+                task: tokio::sync::Mutex::new(Some(task)),
+            }),
+        );
 
         Ok(())
     }
@@ -399,22 +530,25 @@ impl DownloadScheduler for LibrqbitScheduler {
             .active
             .lock()
             .expect("active lock poisoned")
-            .remove(&id);
+            .get(&id)
+            .cloned();
         let Some(entry) = entry else {
             return Ok(false);
         };
 
-        entry.token.cancel();
-        if tokio::time::timeout(CANCEL_WAIT, entry.task).await.is_err() {
-            warn!(download_id = %id, "timed out waiting for cancelled download to stop");
-        }
+        entry.cancel(CANCEL_WAIT).await?;
+        self.inner
+            .active
+            .lock()
+            .expect("active lock poisoned")
+            .remove(&id);
 
         Ok(true)
     }
 
     async fn shutdown(&self) {
         self.inner.shutdown.cancel();
-        let entries: Vec<ActiveDownload> = self
+        let entries: Vec<Arc<ActiveDownload>> = self
             .inner
             .active
             .lock()
@@ -424,11 +558,108 @@ impl DownloadScheduler for LibrqbitScheduler {
             .collect();
 
         for entry in entries {
-            if tokio::time::timeout(CANCEL_WAIT, entry.task).await.is_err() {
-                debug!("download task did not stop in time during shutdown");
+            let mut task = entry.task.lock().await;
+            if let Some(handle) = task.as_mut() {
+                if tokio::time::timeout(CANCEL_WAIT, handle).await.is_err() {
+                    debug!("download task did not stop in time during shutdown");
+                }
             }
         }
 
         self.inner.session.stop().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tracker_policy;
+
+    #[test]
+    fn padding_files_are_excluded_without_renumbering_real_files() {
+        let file = |path: &str, padding| {
+            let mut file = librqbit::file_info::FileInfo {
+                relative_filename: path.into(),
+                offset_in_torrent: 0,
+                piece_range: 0..1,
+                attrs: Default::default(),
+                len: 10,
+            };
+            file.attrs.padding = padding;
+            file
+        };
+        let files = super::downloadable_files(&[
+            file("first.mp3", false),
+            file(".pad/10", true),
+            file("last.mp3", false),
+        ])
+        .unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(
+            (files[0].file_index, files[0].relative_path.as_str()),
+            (0, "first.mp3")
+        );
+        assert_eq!(
+            (files[1].file_index, files[1].relative_path.as_str()),
+            (2, "last.mp3")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_timeout_keeps_handle_for_serialized_retries() {
+        let (release, stopped) = tokio::sync::oneshot::channel();
+        let entry = std::sync::Arc::new(super::ActiveDownload {
+            token: tokio_util::sync::CancellationToken::new(),
+            task: tokio::sync::Mutex::new(Some(tokio::spawn(async move {
+                let _ = stopped.await;
+            }))),
+        });
+        assert!(matches!(
+            entry.cancel(std::time::Duration::ZERO).await,
+            Err(crate::error::AppError::CancellationInProgress)
+        ));
+        assert!(entry.token.is_cancelled());
+        assert!(entry.task.lock().await.is_some());
+        release.send(()).unwrap();
+        let other = entry.clone();
+        let (first, second) = tokio::join!(
+            entry.cancel(std::time::Duration::from_secs(1)),
+            other.cancel(std::time::Duration::from_secs(1))
+        );
+        first.unwrap();
+        second.unwrap();
+        assert!(entry.task.lock().await.is_none());
+    }
+
+    #[test]
+    fn secure_policy_strips_http_and_https_but_preserves_udp_and_hash() {
+        let magnet = "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&tr=http%3A%2F%2Fa.example%2Fannounce&tr=https%3A%2F%2Fb.example%2Fannounce&tr=udp%3A%2F%2Fc.example%3A80&dn=Book";
+        let result = url::Url::parse(&tracker_policy(magnet, false)).unwrap();
+        let trackers: Vec<_> = result
+            .query_pairs()
+            .filter(|(k, _)| k == "tr")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(trackers, ["udp://c.example:80"]);
+        assert!(result
+            .query_pairs()
+            .any(|(k, v)| k == "xt" && v == "urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(result.query_pairs().any(|(k, v)| k == "dn" && v == "Book"));
+    }
+
+    #[test]
+    fn opt_in_preserves_http_trackers_unchanged() {
+        let magnet = "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&tr=https%3A%2F%2Fa.example%2Fannounce";
+        assert_eq!(tracker_policy(magnet, true), magnet);
+    }
+
+    #[test]
+    fn secure_policy_allows_trackerless_magnets() {
+        let magnet = "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let result = url::Url::parse(&tracker_policy(magnet, false)).unwrap();
+        let original = url::Url::parse(magnet).unwrap();
+        assert_eq!(
+            result.query_pairs().collect::<Vec<_>>(),
+            original.query_pairs().collect::<Vec<_>>()
+        );
     }
 }

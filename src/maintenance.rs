@@ -114,7 +114,45 @@ pub async fn cleanup_stale_failed_downloads(
     };
     let mut removed = 0;
 
-    for row in repo.list_stale_failed(cutoff).await? {
+    cleanup_rows(
+        repo,
+        storage_root,
+        repo.list_stale_failed(cutoff).await?,
+        &mut removed,
+    )
+    .await?;
+    Ok(removed)
+}
+
+/// Retain expired history for the configured number of days after expiration.
+pub async fn cleanup_stale_expired_downloads(
+    repo: &DownloadRepo,
+    storage_root: &Path,
+    retention_days: i64,
+) -> Result<usize, AppError> {
+    let Some(cutoff) = Duration::try_days(retention_days)
+        .and_then(|retention| Utc::now().checked_sub_signed(retention))
+    else {
+        return Ok(0);
+    };
+    let mut removed = 0;
+    cleanup_rows(
+        repo,
+        storage_root,
+        repo.list_stale_expired(cutoff).await?,
+        &mut removed,
+    )
+    .await?;
+    Ok(removed)
+}
+
+async fn cleanup_rows(
+    repo: &DownloadRepo,
+    storage_root: &Path,
+    rows: Vec<crate::db::models::DownloadRow>,
+    removed: &mut usize,
+) -> Result<(), AppError> {
+    for row in rows {
         match resolve_stored_download_dir(storage_root, Path::new(&row.storage_dir)).await {
             Ok(storage_dir) => {
                 if let Err(error) = delete_dir_if_exists(&storage_dir).await {
@@ -132,8 +170,8 @@ pub async fn cleanup_stale_failed_downloads(
             continue;
         }
 
-        removed += 1;
+        *removed += 1;
     }
 
-    Ok(removed)
+    Ok(())
 }

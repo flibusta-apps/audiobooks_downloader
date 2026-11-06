@@ -10,6 +10,7 @@ pub struct ScheduledDownload {
     pub id: Uuid,
     pub magnet_uri: String,
     pub storage_dir: PathBuf,
+    pub allow_http_trackers: bool,
 }
 
 #[async_trait]

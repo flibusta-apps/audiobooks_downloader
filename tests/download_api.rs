@@ -320,6 +320,36 @@ async fn delete_download_removes_the_row_and_calls_cancel() {
 }
 
 #[tokio::test]
+async fn delete_keeps_row_files_and_directory_until_cancellation_is_confirmed() {
+    let app = spawn().await;
+    let id = app
+        .insert_download_with_file(DownloadStatus::Downloading, "book.mp3", b"audio", None)
+        .await;
+    app.scheduler.set_cancellation_pending(true);
+    let request = || {
+        Request::delete(format!("/api/v1/downloads/{id}"))
+            .header("x-api-key", "test-api-key")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = app.app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(app.repo.get_download(id).await.unwrap().is_some());
+    assert_eq!(app.repo.list_files(id).await.unwrap().len(), 1);
+    assert!(app
+        .storage_root
+        .join(id.to_string())
+        .join("book.mp3")
+        .exists());
+    app.scheduler.set_cancellation_pending(false);
+    let response = app.app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(app.repo.get_download(id).await.unwrap().is_none());
+    assert!(app.repo.list_files(id).await.unwrap().is_empty());
+    assert!(!app.storage_root.join(id.to_string()).exists());
+}
+
+#[tokio::test]
 async fn delete_download_rejects_tampered_storage_dirs_outside_storage_root() {
     let test_app = spawn().await;
     let download_id = test_app.insert_pending_download().await;

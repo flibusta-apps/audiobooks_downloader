@@ -12,6 +12,88 @@ use tempfile::tempdir;
 use uuid::Uuid;
 
 #[tokio::test]
+async fn dedup_and_queue_admission_are_atomic() {
+    use audiobooks_downloader::{db::InsertDownloadResult, error::AppError};
+    let dir = tempdir().unwrap();
+    let pool = connect(&format!(
+        "sqlite://{}",
+        dir.path().join("admission.sqlite").display()
+    ))
+    .await
+    .unwrap();
+    migrate(&pool).await.unwrap();
+    let repo = DownloadRepo::new(pool);
+    let new = |hash: &str| NewDownload {
+        id: Uuid::now_v7(),
+        magnet_uri: format!("magnet:?xt=urn:btih:{hash}"),
+        status: DownloadStatus::PendingMetadata.as_db().into(),
+        storage_dir: dir.path().display().to_string(),
+        info_hash: Some(hash.into()),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let first = new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let first_id = first.id;
+    assert!(matches!(
+        repo.insert_download_dedup(first, 1).await.unwrap(),
+        InsertDownloadResult::Inserted
+    ));
+    let duplicate = repo
+        .insert_download_dedup(new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), 1)
+        .await
+        .unwrap();
+    assert!(matches!(duplicate, InsertDownloadResult::Existing(row) if row.id == first_id));
+    let rejected = new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    let rejected_id = rejected.id;
+    assert!(matches!(
+        repo.insert_download_dedup(rejected, 1).await,
+        Err(AppError::QueueFull)
+    ));
+    assert!(repo.get_download(rejected_id).await.unwrap().is_none());
+    repo.mark_failed(first_id, "test failure").await.unwrap();
+    assert!(matches!(
+        repo.insert_download_dedup(new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), 1)
+            .await
+            .unwrap(),
+        InsertDownloadResult::Inserted
+    ));
+}
+
+#[tokio::test]
+async fn concurrent_dedup_admission_returns_one_insert_and_one_existing() {
+    use audiobooks_downloader::db::InsertDownloadResult;
+    let dir = tempdir().unwrap();
+    let pool = connect(&format!(
+        "sqlite://{}",
+        dir.path().join("race.sqlite").display()
+    ))
+    .await
+    .unwrap();
+    migrate(&pool).await.unwrap();
+    let repo = DownloadRepo::new(pool);
+    let new = || NewDownload {
+        id: Uuid::now_v7(),
+        magnet_uri: "magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        status: DownloadStatus::PendingMetadata.as_db().into(),
+        storage_dir: dir.path().display().to_string(),
+        info_hash: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let (a, b) = tokio::join!(
+        repo.insert_download_dedup(new(), 1),
+        repo.insert_download_dedup(new(), 1)
+    );
+    match (a.unwrap(), b.unwrap()) {
+        (InsertDownloadResult::Inserted, InsertDownloadResult::Existing(row))
+        | (InsertDownloadResult::Existing(row), InsertDownloadResult::Inserted) => {
+            assert!(repo.get_download(row.id).await.unwrap().is_some());
+        }
+        _ => panic!("expected exactly one insert and one existing row"),
+    }
+}
+
+#[tokio::test]
 async fn repository_roundtrips_download_and_files() {
     let temp_dir = tempdir().unwrap();
     let database_path = temp_dir.path().join("repository.sqlite");

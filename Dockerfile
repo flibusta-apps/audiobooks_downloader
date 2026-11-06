@@ -1,4 +1,4 @@
-FROM rust:1-bookworm AS builder
+FROM rust:1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -16,7 +16,7 @@ COPY migrations ./migrations
 
 RUN cargo build --release --locked
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

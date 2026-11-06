@@ -28,6 +28,7 @@ use uuid::Uuid;
 struct SchedulerState {
     scheduled: Vec<ScheduledDownload>,
     cancelled: Vec<Uuid>,
+    cancellation_pending: bool,
 }
 
 #[derive(Clone, Default)]
@@ -36,6 +37,10 @@ pub struct RecordingScheduler {
 }
 
 impl RecordingScheduler {
+    #[allow(dead_code)]
+    pub fn set_cancellation_pending(&self, pending: bool) {
+        self.state.lock().unwrap().cancellation_pending = pending;
+    }
     #[allow(dead_code)]
     pub async fn scheduled_count(&self) -> usize {
         self.state.lock().unwrap().scheduled.len()
@@ -55,6 +60,9 @@ impl DownloadScheduler for RecordingScheduler {
     }
 
     async fn cancel(&self, id: Uuid) -> Result<bool, AppError> {
+        if self.state.lock().unwrap().cancellation_pending {
+            return Err(AppError::CancellationInProgress);
+        }
         self.state.lock().unwrap().cancelled.push(id);
         Ok(true)
     }
@@ -96,7 +104,12 @@ impl TestApp {
                 api_key: "test-api-key".to_string(),
                 download_ttl_secs: 86_400,
                 cleanup_interval_secs: 60,
+                expired_retention_days: 30,
                 max_concurrent_downloads: 3,
+                max_download_tasks: 50,
+                max_torrent_files: 10_000,
+                allow_http_trackers: false,
+                torrent_socks_proxy_url: None,
                 metadata_timeout_secs: 600,
                 no_progress_timeout_secs: 600,
                 max_torrent_bytes: None,

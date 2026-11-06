@@ -4,7 +4,10 @@ use audiobooks_downloader::{
     app::build_app,
     config::Config,
     db::{connect, migrate, DownloadRepo},
-    maintenance::{cleanup_stale_failed_downloads, expire_due_downloads, run_startup_recovery},
+    maintenance::{
+        cleanup_stale_expired_downloads, cleanup_stale_failed_downloads, expire_due_downloads,
+        run_startup_recovery,
+    },
     scheduler::DownloadScheduler,
     state::AppState,
     storage::acquire_instance_lock,
@@ -45,10 +48,20 @@ async fn main() -> anyhow::Result<()> {
     let cleaner_storage_root = config.storage_root.clone();
     let cleanup_interval_secs = config.cleanup_interval_secs;
     let failed_ttl_secs = config.download_ttl_secs;
+    let expired_retention_days = config.expired_retention_days;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(cleanup_interval_secs));
         loop {
             interval.tick().await;
+            if let Err(error) = cleanup_stale_expired_downloads(
+                &cleaner_repo,
+                &cleaner_storage_root,
+                expired_retention_days,
+            )
+            .await
+            {
+                error!(%error, "expired-history cleanup task failed");
+            }
             if let Err(error) = expire_due_downloads(&cleaner_repo, &cleaner_storage_root).await {
                 error!(%error, "cleanup task failed");
             }

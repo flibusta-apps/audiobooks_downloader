@@ -19,7 +19,12 @@ pub struct Config {
     pub api_key: String,
     pub download_ttl_secs: i64,
     pub cleanup_interval_secs: u64,
+    pub expired_retention_days: i64,
     pub max_concurrent_downloads: usize,
+    pub max_download_tasks: usize,
+    pub max_torrent_files: usize,
+    pub allow_http_trackers: bool,
+    pub torrent_socks_proxy_url: Option<String>,
     pub metadata_timeout_secs: u64,
     pub no_progress_timeout_secs: u64,
     pub max_torrent_bytes: Option<u64>,
@@ -38,6 +43,8 @@ impl Config {
             .unwrap_or_else(|_| PathBuf::from("./storage"));
         let api_key = parse_required_env(env::var("APP_API_KEY").ok(), "APP_API_KEY")?;
         let download_ttl_secs = parse_ttl_secs(env::var("APP_DOWNLOAD_TTL_SECS").ok())?;
+        let expired_retention_days =
+            parse_expired_retention_days(env::var("EXPIRED_RETENTION_DAYS").ok())?;
         let cleanup_interval_secs = parse_bounded_env_or_default(
             env::var("APP_CLEANUP_INTERVAL_SECS").ok(),
             "APP_CLEANUP_INTERVAL_SECS",
@@ -77,6 +84,26 @@ impl Config {
             None => None,
         };
         let tracker_allowlist = parse_allowlist(env::var("TRACKER_ALLOWLIST").ok());
+        let max_download_tasks = parse_bounded_env_or_default(
+            env::var("MAX_DOWNLOAD_TASKS").ok(),
+            "MAX_DOWNLOAD_TASKS",
+            50_usize,
+            1,
+            10_000,
+        )?;
+        let max_torrent_files = parse_bounded_env_or_default(
+            env::var("MAX_TORRENT_FILES").ok(),
+            "MAX_TORRENT_FILES",
+            10_000_usize,
+            1,
+            100_000,
+        )?;
+        let allow_http_trackers = parse_env_or_default(
+            env::var("ALLOW_HTTP_TRACKERS").ok(),
+            "ALLOW_HTTP_TRACKERS",
+            false,
+        )?;
+        let torrent_socks_proxy_url = env::var("TORRENT_SOCKS_PROXY_URL").ok();
 
         Ok(Self {
             bind_addr,
@@ -85,7 +112,12 @@ impl Config {
             api_key,
             download_ttl_secs,
             cleanup_interval_secs,
+            expired_retention_days,
             max_concurrent_downloads,
+            max_download_tasks,
+            max_torrent_files,
+            allow_http_trackers,
+            torrent_socks_proxy_url,
             metadata_timeout_secs,
             no_progress_timeout_secs,
             max_torrent_bytes,
@@ -144,6 +176,10 @@ pub fn parse_ttl_secs(value: Option<String>) -> Result<i64> {
         1,
         MAX_DOWNLOAD_TTL_SECS,
     )
+}
+
+pub fn parse_expired_retention_days(value: Option<String>) -> Result<i64> {
+    parse_bounded_env_or_default(value, "EXPIRED_RETENTION_DAYS", 30, 1, 3650)
 }
 
 fn parse_allowlist(value: Option<String>) -> Option<Vec<String>> {
@@ -225,6 +261,15 @@ mod tests {
         assert!(parse_ttl_secs(Some(i64::MAX.to_string())).is_err());
         assert!(parse_ttl_secs(Some((MAX_DOWNLOAD_TTL_SECS + 1).to_string())).is_err());
         assert!(parse_ttl_secs(Some("abc".to_string())).is_err());
+    }
+
+    #[test]
+    fn expired_retention_defaults_and_validates_bounds() {
+        assert_eq!(parse_expired_retention_days(None).unwrap(), 30);
+        assert_eq!(parse_expired_retention_days(Some("1".into())).unwrap(), 1);
+        for value in ["0", "-1", "3651", "invalid"] {
+            assert!(parse_expired_retention_days(Some(value.into())).is_err());
+        }
     }
 
     #[test]

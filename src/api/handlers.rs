@@ -17,7 +17,10 @@ use crate::{
         CreateDownloadRequest, CreateDownloadResponse, DownloadFileResponse, DownloadFilesResponse,
         DownloadResponse, DownloadStatsResponse,
     },
-    db::models::{DownloadFileRow, DownloadRow, NewDownload},
+    db::{
+        models::{DownloadFileRow, DownloadRow, NewDownload},
+        InsertDownloadResult,
+    },
     domain::DownloadStatus,
     error::AppError,
     magnet::sanitize_magnet,
@@ -50,21 +53,20 @@ pub async fn create_download(
     let now = Utc::now();
     let storage_dir = state.config.storage_root.join(id.to_string());
 
-    tokio::fs::create_dir_all(&storage_dir)
-        .await
-        .map_err(|error| AppError::Storage(error.to_string()))?;
-
     let existing = match state
         .repo
-        .insert_download_dedup(NewDownload {
-            id,
-            magnet_uri: magnet.uri.clone(),
-            status: DownloadStatus::PendingMetadata.as_db().to_string(),
-            storage_dir: storage_dir.to_string_lossy().into_owned(),
-            info_hash: Some(magnet.info_hash.clone()),
-            created_at: now,
-            updated_at: now,
-        })
+        .insert_download_dedup(
+            NewDownload {
+                id,
+                magnet_uri: magnet.uri.clone(),
+                status: DownloadStatus::PendingMetadata.as_db().to_string(),
+                storage_dir: storage_dir.to_string_lossy().into_owned(),
+                info_hash: Some(magnet.info_hash.clone()),
+                created_at: now,
+                updated_at: now,
+            },
+            state.config.max_download_tasks,
+        )
         .await
     {
         Ok(existing) => existing,
@@ -74,7 +76,7 @@ pub async fn create_download(
         }
     };
 
-    if let Some(existing) = existing {
+    if let InsertDownloadResult::Existing(existing) = existing {
         let _ = tokio::fs::remove_dir_all(&storage_dir).await;
         let status = effective_download_status(&existing)?;
         return Ok((
@@ -87,12 +89,18 @@ pub async fn create_download(
         ));
     }
 
+    if let Err(error) = tokio::fs::create_dir_all(&storage_dir).await {
+        let _ = state.repo.delete_download(id).await;
+        return Err(AppError::Storage(error.to_string()));
+    }
+
     if let Err(error) = state
         .scheduler
         .schedule(ScheduledDownload {
             id,
             magnet_uri: magnet.uri,
             storage_dir: storage_dir.clone(),
+            allow_http_trackers: state.config.allow_http_trackers,
         })
         .await
     {
@@ -160,7 +168,7 @@ pub async fn delete_download(
     .await?;
 
     // Stop the torrent first so nothing writes into the directory afterwards.
-    let _ = state.scheduler.cancel(id).await;
+    state.scheduler.cancel(id).await?;
     delete_dir_if_exists(&storage_dir).await?;
     state.repo.delete_download(id).await?;
 

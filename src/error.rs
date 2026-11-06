@@ -8,6 +8,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AppError {
+    #[error("cancellation in progress; retry later")]
+    CancellationInProgress,
+    #[error("download queue is full; try again later")]
+    QueueFull,
     #[error("unauthorized")]
     Unauthorized,
     #[error("not found")]
@@ -42,6 +46,8 @@ struct ErrorBody {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, code) = match &self {
+            Self::CancellationInProgress => (StatusCode::CONFLICT, "cancellation_in_progress"),
+            Self::QueueFull => (StatusCode::TOO_MANY_REQUESTS, "queue_full"),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Self::DownloadNotReady => (StatusCode::CONFLICT, "download_not_ready"),
