@@ -10,11 +10,11 @@ axum = "0.8"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 dotenvy = "0.15"
 http = "1"
-librqbit = "8.1.1"
+librqbit = "9.1.0"
 mime_guess = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono", "uuid"] }
+sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono", "uuid"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "net", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
@@ -29,3 +29,7 @@ uuid = { version = "1", features = ["v7", "serde"] }
 [dev-dependencies]
 http-body-util = "0.1"
 tempfile = "3"
+
+[patch.crates-io]
+# Remove once a published librqbit-utp release includes RUSTSEC-2026-0293's fix.
+librqbit-utp = { git = "https://github.com/ikatson/librqbit-utp.git", rev = "06e1c53c8df6edb2830d6aab64a6d4bed8479908" }
