@@ -296,7 +296,7 @@ pub async fn stream_file(
         .oneshot(request)
         .await
         .map(|response| response.map(Body::new))
-        .map_err(|error| AppError::Internal(error.to_string()))
+        .map_err(|never| match never {})
 }
 
 fn safe_download_filename(relative_path: &str) -> String {

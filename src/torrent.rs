@@ -8,8 +8,8 @@ use std::{
 use async_trait::async_trait;
 use chrono::Utc;
 use librqbit::{
-    api::TorrentIdOrHash, AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent,
-    Session, SessionOptions, TorrentStatsState,
+    api::TorrentIdOrHash, AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig,
+    ManagedTorrent, Session, SessionOptions, TorrentStatsState,
 };
 use tokio::{
     sync::Semaphore,
@@ -31,8 +31,8 @@ use crate::{
 const CANCEL_WAIT: Duration = Duration::from_secs(15);
 const PROGRESS_TICK: Duration = Duration::from_secs(1);
 
-/// HTTP tracker redirects and response sizes cannot be constrained in librqbit
-/// 8.1.1. Strip them before either metadata resolution or the real add.
+/// HTTP tracker redirects and response sizes cannot be constrained in librqbit.
+/// Strip them before either metadata resolution or the real add.
 fn tracker_policy(magnet: &str, allow_http: bool) -> String {
     if allow_http {
         return magnet.to_owned();
@@ -59,6 +59,25 @@ pub struct SchedulerSettings {
     pub no_progress_timeout: Duration,
     pub max_torrent_bytes: Option<u64>,
     pub max_torrent_files: usize,
+}
+
+fn session_options(proxy_url: Option<String>) -> SessionOptions {
+    SessionOptions {
+        dht: Some(DhtSessionConfig {
+            persistence: None,
+            ..Default::default()
+        }),
+        // UPnP is a listener option in librqbit 9. No peer listener means
+        // neither incoming peer connections nor UPnP port forwarding.
+        listen: None,
+        // librqbit 8 did not discover peers on the local network.
+        disable_local_service_discovery: true,
+        connect: Some(librqbit::ConnectionOptions {
+            proxy_url,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 impl SchedulerSettings {
@@ -126,7 +145,7 @@ enum Outcome {
 impl LibrqbitScheduler {
     /// Creates the single shared session. DHT state is not persisted (the
     /// default would write into the user's config dir) and nothing is
-    /// listening for incoming connections.
+    /// listening for incoming peer connections (DHT still uses UDP).
     pub async fn new(repo: DownloadRepo, config: &Config) -> anyhow::Result<Self> {
         let settings = SchedulerSettings::from_config(config);
         if config.allow_http_trackers {
@@ -134,12 +153,7 @@ impl LibrqbitScheduler {
         }
         let session = Session::new_with_opts(
             config.storage_root.clone(),
-            SessionOptions {
-                disable_dht_persistence: true,
-                enable_upnp_port_forwarding: false,
-                socks_proxy_url: config.torrent_socks_proxy_url.clone(),
-                ..Default::default()
-            },
+            session_options(config.torrent_socks_proxy_url.clone()),
         )
         .await?;
 
@@ -163,19 +177,15 @@ fn metadata_files(
 ) -> anyhow::Result<(String, i64, u64, Vec<NewDownloadFile>)> {
     handle.with_metadata(|metadata| {
         let name = metadata
+            .info
+            .info()
             .name
-            .clone()
-            .or_else(|| {
-                metadata
-                    .info
-                    .name
-                    .as_ref()
-                    .and_then(|value| std::str::from_utf8(value.as_ref()).ok())
-                    .map(ToOwned::to_owned)
-            })
+            .as_ref()
+            .and_then(|value| std::str::from_utf8(value.as_ref()).ok())
+            .map(ToOwned::to_owned)
             .unwrap_or_else(|| "torrent".to_string());
 
-        let total = metadata.lengths.total_length();
+        let total = metadata.lengths().total_length();
         let total_bytes = i64::try_from(total)?;
         let files = downloadable_files(&metadata.file_infos)?;
 
@@ -276,13 +286,11 @@ impl Inner {
         };
         // List-only does not create payload files. Reuse exactly the checked bytes
         // rather than resolving the magnet again (no metadata TOCTOU).
-        if metadata.info.piece_length == 0 {
+        if metadata.info.info().piece_length == 0 {
             return Outcome::Failed("invalid torrent piece length");
         }
-        let lengths = match metadata.info.iter_file_lengths() {
-            Ok(lengths) => lengths,
-            Err(_) => return Outcome::Failed("invalid torrent file list"),
-        };
+        // librqbit 9 validates the file list before returning list-only metadata.
+        let lengths = metadata.info.iter_file_lengths();
         let mut count = 0_usize;
         let mut total = 0_u64;
         for length in lengths {
@@ -573,6 +581,64 @@ impl DownloadScheduler for LibrqbitScheduler {
 #[cfg(test)]
 mod tests {
     use super::tracker_policy;
+
+    #[test]
+    fn session_keeps_dht_ephemeral_and_peer_listeners_disabled() {
+        let options = super::session_options(Some("socks5://localhost:1080".into()));
+        assert!(options.dht.as_ref().unwrap().persistence.is_none());
+        assert!(options.listen.is_none());
+        assert!(options.disable_local_service_discovery);
+        assert!(options.persistence.is_none());
+        assert_eq!(
+            options.connect.as_ref().unwrap().proxy_url.as_deref(),
+            Some("socks5://localhost:1080")
+        );
+        assert!(options.connect.as_ref().unwrap().enable_tcp);
+        assert!(super::session_options(None)
+            .connect
+            .unwrap()
+            .proxy_url
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn metadata_preserves_name_lengths_and_file_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let session = librqbit::Session::new_with_opts(
+            root.path().to_owned(),
+            librqbit::SessionOptions {
+                dht: None,
+                disable_trackers: true,
+                ..super::session_options(None)
+            },
+        )
+        .await
+        .unwrap();
+        let torrent = b"d4:infod6:lengthi3e4:name8:book.mp312:piece lengthi4e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+        let response = session
+            .add_torrent(
+                librqbit::AddTorrent::from_bytes(torrent.as_slice()),
+                Some(librqbit::AddTorrentOptions {
+                    paused: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let librqbit::AddTorrentResponse::Added(_, handle) = response else {
+            panic!("expected a new torrent");
+        };
+        handle.wait_until_initialized().await.unwrap();
+        let (name, total_bytes, total, files) = super::metadata_files(&handle).unwrap();
+        assert_eq!(name, "book.mp3");
+        assert_eq!((total_bytes, total), (3, 3));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_index, 0);
+        assert_eq!(files[0].relative_path, "book.mp3");
+        assert_eq!(files[0].size_bytes, 3);
+        assert_eq!(files[0].mime_type, "audio/mpeg");
+        session.stop().await;
+    }
 
     #[test]
     fn padding_files_are_excluded_without_renumbering_real_files() {

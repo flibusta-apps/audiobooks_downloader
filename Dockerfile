@@ -3,6 +3,7 @@ FROM rust:1-bookworm@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        cmake \
         libsqlite3-dev \
         libssl-dev \
         pkg-config \
